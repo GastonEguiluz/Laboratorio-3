@@ -1,0 +1,107 @@
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+
+#define R_SERIE 10000.0
+#define R_NOMINAL 10000.0
+#define TEMP_NOMINAL 25.0
+#define BETA 3950.0
+
+void uart_init(void)
+{
+    UBRR0H = 0;
+    UBRR0L = 103;
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void uart_putchar(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = c;
+}
+
+void uart_print(const char *texto)
+{
+    while (*texto)
+    {
+        uart_putchar(*texto);
+        texto++;
+    }
+}
+
+void adc_init(void)
+{
+    ADMUX = (1 << REFS0);
+    ADCSRA = (1 << ADEN) |
+             (1 << ADPS2) |
+             (1 << ADPS1) |
+             (1 << ADPS0);
+}
+
+uint16_t adc_read(uint8_t canal)
+{
+    ADMUX = (ADMUX & 0xF0) | (canal & 0x0F);
+    ADCSRA |= (1 << ADSC);
+
+    while (ADCSRA & (1 << ADSC));
+
+    return ADC;
+}
+
+float leer_temperatura(void)
+{
+    uint16_t adc = adc_read(0);
+
+    if (adc == 0)
+        adc = 1;
+
+    if (adc >= 1023)
+        adc = 1022;
+
+    float resistencia = R_SERIE * ((1023.0 / adc) - 1.0);
+    float temperatura = resistencia / R_NOMINAL;
+
+    temperatura = log(temperatura);
+    temperatura /= BETA;
+    temperatura += 1.0 / (TEMP_NOMINAL + 273.15);
+    temperatura = 1.0 / temperatura;
+    temperatura -= 273.15;
+
+    return temperatura;
+}
+
+int main(void)
+{
+    char buffer[50];
+    float temperatura;
+
+    uart_init();
+    adc_init();
+
+    uart_print("Sistema de temperatura iniciado\r\n");
+
+    while (1)
+    {
+        temperatura = leer_temperatura();
+
+        int entero = (int)temperatura;
+        int decimal = (int)((temperatura - entero) * 10);
+
+        if (decimal < 0)
+            decimal = -decimal;
+
+        snprintf(buffer, sizeof(buffer),
+                 "Temperatura: %d.%d C\r\n",
+                 entero, decimal);
+
+        uart_print(buffer);
+
+        _delay_ms(1000);
+    }
+}
