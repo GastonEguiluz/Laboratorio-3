@@ -1,0 +1,90 @@
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+void UART_init(void)
+{
+    UBRR0H = 0;
+    UBRR0L = 103;
+
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void UART_send_char(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0)));
+
+    UDR0 = c;
+}
+
+void UART_send_string(char *texto)
+{
+    while (*texto)
+    {
+        UART_send_char(*texto);
+        texto++;
+    }
+}
+
+void UART_send_number(uint16_t numero)
+{
+    char buffer[10];
+
+    itoa(numero, buffer, 10);
+
+    UART_send_string(buffer);
+}
+
+void ADC_init(void)
+{
+    ADMUX = (1 << REFS0);
+
+    ADCSRA =
+        (1 << ADEN) |
+        (1 << ADPS2) |
+        (1 << ADPS1) |
+        (1 << ADPS0);
+}
+
+uint16_t ADC_read(uint8_t canal)
+{
+    ADMUX = (ADMUX & 0xF0) | canal;
+
+    ADCSRA |= (1 << ADSC);
+
+    while (ADCSRA & (1 << ADSC));
+
+    return ADC;
+}
+
+int main(void)
+{
+    uint16_t ldr;
+    uint16_t posicion;
+
+    UART_init();
+    ADC_init();
+
+    UART_send_string("LECTURA DE SENSORES\r\n");
+
+    while (1)
+    {
+        ldr = ADC_read(0);
+        posicion = ADC_read(1);
+
+        UART_send_string("LDR: ");
+        UART_send_number(ldr);
+
+        UART_send_string(" | Posicion: ");
+        UART_send_number(posicion);
+
+        UART_send_string("\r\n");
+
+        _delay_ms(200);
+    }
+}
