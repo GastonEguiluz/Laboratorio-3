@@ -1,0 +1,572 @@
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+
+#define LCD_ADDR 0x27
+
+#define LCD_RS 0x01
+#define LCD_EN 0x04
+#define LCD_BL 0x08
+
+#define HEATER PB0
+#define FAN_PWM PB1
+
+#define RELAY_ACTIVE_LOW 1
+
+#define R_SERIE 10000.0
+#define R_NOMINAL 10000.0
+#define TEMP_NOMINAL 25.0
+#define BETA 3950.0
+
+int punto_medio = 22;
+
+int rango_min;
+int rango_max;
+int fan_bajo_max;
+int fan_medio_max;
+
+uint8_t calefactor = 0;
+uint8_t velocidad_ventilador = 0;
+
+const char *accion_actual;
+
+void uart_init(void)
+{
+    UBRR0H = 0;
+    UBRR0L = 103;
+
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+}
+
+void uart_putchar(char c)
+{
+    while (!(UCSR0A & (1 << UDRE0)));
+    UDR0 = c;
+}
+
+void uart_print(const char *texto)
+{
+    while (*texto)
+    {
+        uart_putchar(*texto);
+        texto++;
+    }
+}
+
+uint8_t uart_available(void)
+{
+    return UCSR0A & (1 << RXC0);
+}
+
+char uart_getchar(void)
+{
+    return UDR0;
+}
+
+void i2c_init(void)
+{
+    TWSR = 0;
+    TWBR = 72;
+    TWCR = (1 << TWEN);
+}
+
+void i2c_start(void)
+{
+    TWCR = (1 << TWINT) |
+           (1 << TWSTA) |
+           (1 << TWEN);
+
+    while (!(TWCR & (1 << TWINT)));
+}
+
+void i2c_stop(void)
+{
+    TWCR = (1 << TWINT) |
+           (1 << TWSTO) |
+           (1 << TWEN);
+}
+
+void i2c_write(uint8_t data)
+{
+    TWDR = data;
+
+    TWCR = (1 << TWINT) |
+           (1 << TWEN);
+
+    while (!(TWCR & (1 << TWINT)));
+}
+
+void lcd_expander_write(uint8_t data)
+{
+    i2c_start();
+    i2c_write(LCD_ADDR << 1);
+    i2c_write(data | LCD_BL);
+    i2c_stop();
+}
+
+void lcd_pulse(uint8_t data)
+{
+    lcd_expander_write(data | LCD_EN);
+    _delay_us(1);
+    lcd_expander_write(data & ~LCD_EN);
+    _delay_us(50);
+}
+
+void lcd_send_nibble(uint8_t nibble, uint8_t rs)
+{
+    uint8_t data = nibble & 0xF0;
+
+    if (rs)
+        data |= LCD_RS;
+
+    lcd_expander_write(data);
+    lcd_pulse(data);
+}
+
+void lcd_send_byte(uint8_t data, uint8_t rs)
+{
+    lcd_send_nibble(data & 0xF0, rs);
+    lcd_send_nibble((data << 4) & 0xF0, rs);
+}
+
+void lcd_cmd(uint8_t cmd)
+{
+    lcd_send_byte(cmd, 0);
+
+    if (cmd == 0x01 || cmd == 0x02)
+        _delay_ms(2);
+}
+
+void lcd_data(uint8_t data)
+{
+    lcd_send_byte(data, 1);
+}
+
+void lcd_init(void)
+{
+    _delay_ms(50);
+
+    lcd_send_nibble(0x30, 0);
+    _delay_ms(5);
+
+    lcd_send_nibble(0x30, 0);
+    _delay_us(150);
+
+    lcd_send_nibble(0x30, 0);
+    lcd_send_nibble(0x20, 0);
+
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_cmd(0x01);
+}
+
+void lcd_line(uint8_t fila, const char *texto)
+{
+    uint8_t i;
+
+    if (fila == 0)
+        lcd_cmd(0x80);
+    else
+        lcd_cmd(0xC0);
+
+    for (i = 0; i < 16; i++)
+    {
+        if (*texto)
+        {
+            lcd_data(*texto);
+            texto++;
+        }
+        else
+        {
+            lcd_data(' ');
+        }
+    }
+}
+
+void adc_init(void)
+{
+    ADMUX = (1 << REFS0);
+
+    ADCSRA = (1 << ADEN) |
+             (1 << ADPS2) |
+             (1 << ADPS1) |
+             (1 << ADPS0);
+}
+
+uint16_t adc_read(uint8_t canal)
+{
+    ADMUX = (ADMUX & 0xF0) | (canal & 0x0F);
+
+    ADCSRA |= (1 << ADSC);
+
+    while (ADCSRA & (1 << ADSC));
+
+    return ADC;
+}
+
+float leer_temperatura(void)
+{
+    uint16_t adc;
+    float resistencia;
+    float temperatura;
+
+    adc = adc_read(0);
+
+    if (adc == 0)
+        adc = 1;
+
+    if (adc >= 1023)
+        adc = 1022;
+
+    resistencia = R_SERIE * ((1023.0 / adc) - 1.0);
+
+    temperatura = resistencia / R_NOMINAL;
+
+    temperatura = log(temperatura);
+    temperatura /= BETA;
+    temperatura += 1.0 / (TEMP_NOMINAL + 273.15);
+    temperatura = 1.0 / temperatura;
+    temperatura -= 273.15;
+
+    return temperatura;
+}
+
+void pwm_init(void)
+{
+    DDRB |= (1 << FAN_PWM);
+
+    TCCR1A = (1 << COM1A1) |
+             (1 << WGM10);
+
+    TCCR1B = (1 << WGM12) |
+             (1 << CS11) |
+             (1 << CS10);
+
+    OCR1A = 0;
+}
+
+void fan_set(uint8_t porcentaje)
+{
+    if (porcentaje > 100)
+        porcentaje = 100;
+
+    OCR1A = ((uint16_t)porcentaje * 255) / 100;
+
+    velocidad_ventilador = porcentaje;
+}
+
+void heater_on(void)
+{
+#if RELAY_ACTIVE_LOW
+    PORTB &= ~(1 << HEATER);
+#else
+    PORTB |= (1 << HEATER);
+#endif
+
+    calefactor = 1;
+}
+
+void heater_off(void)
+{
+#if RELAY_ACTIVE_LOW
+    PORTB |= (1 << HEATER);
+#else
+    PORTB &= ~(1 << HEATER);
+#endif
+
+    calefactor = 0;
+}
+
+void recalcular_rangos(void)
+{
+    rango_min = punto_medio - 6;
+    rango_max = punto_medio + 6;
+
+    fan_bajo_max = punto_medio + 17;
+    fan_medio_max = punto_medio + 28;
+}
+
+void controlar_temperatura(float temperatura)
+{
+    if (temperatura < rango_min)
+    {
+        heater_on();
+        fan_set(0);
+        accion_actual = "CALEFACTOR";
+    }
+    else if (temperatura <= rango_max)
+    {
+        heater_off();
+        fan_set(0);
+        accion_actual = "RANGO IDEAL";
+    }
+    else if (temperatura <= fan_bajo_max)
+    {
+        heater_off();
+        fan_set(35);
+        accion_actual = "FAN BAJO";
+    }
+    else if (temperatura <= fan_medio_max)
+    {
+        heater_off();
+        fan_set(65);
+        accion_actual = "FAN MEDIO";
+    }
+    else
+    {
+        heater_off();
+        fan_set(100);
+        accion_actual = "FAN ALTO";
+    }
+}
+
+void actualizar_lcd(float temperatura)
+{
+    char linea1[17];
+    char linea2[17];
+
+    int entero;
+    int decimal;
+
+    entero = (int)temperatura;
+
+    decimal = (int)((temperatura - entero) * 10);
+
+    if (decimal < 0)
+        decimal = -decimal;
+
+    snprintf(
+        linea1,
+        sizeof(linea1),
+        "Temp:%d.%d C",
+        entero,
+        decimal
+    );
+
+    snprintf(
+        linea2,
+        sizeof(linea2),
+        "Ideal:%d-%d C",
+        rango_min,
+        rango_max
+    );
+
+    lcd_line(0, linea1);
+    lcd_line(1, linea2);
+}
+
+void mostrar_menu(void)
+{
+    uart_print("\r\n");
+    uart_print("===== CONTROL TEMPERATURA =====\r\n");
+    uart_print("1 - Bajar punto medio\r\n");
+    uart_print("2 - Subir punto medio\r\n");
+    uart_print("3 - Restablecer a 22 C\r\n");
+    uart_print("4 - Mostrar configuracion\r\n");
+    uart_print("M - Mostrar menu\r\n");
+    uart_print("===============================\r\n");
+}
+
+void mostrar_configuracion(void)
+{
+    char buffer[100];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "\r\nPunto medio: %d C\r\n",
+        punto_medio
+    );
+
+    uart_print(buffer);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "Rango ideal: %d - %d C\r\n",
+        rango_min,
+        rango_max
+    );
+
+    uart_print(buffer);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "Fan bajo: %d - %d C\r\n",
+        rango_max + 1,
+        fan_bajo_max
+    );
+
+    uart_print(buffer);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "Fan medio: %d - %d C\r\n",
+        fan_bajo_max + 1,
+        fan_medio_max
+    );
+
+    uart_print(buffer);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "Fan alto: %d C o mas\r\n",
+        fan_medio_max + 1
+    );
+
+    uart_print(buffer);
+}
+
+void procesar_uart(void)
+{
+    char c;
+
+    if (!uart_available())
+        return;
+
+    c = uart_getchar();
+
+    if (c == '1' || c == '-')
+    {
+        if (punto_medio > 7)
+            punto_medio--;
+
+        recalcular_rangos();
+
+        uart_print("\r\nPunto medio disminuido\r\n");
+        mostrar_configuracion();
+    }
+    else if (c == '2' || c == '+')
+    {
+        if (punto_medio < 70)
+            punto_medio++;
+
+        recalcular_rangos();
+
+        uart_print("\r\nPunto medio aumentado\r\n");
+        mostrar_configuracion();
+    }
+    else if (c == '3' || c == 'R' || c == 'r')
+    {
+        punto_medio = 22;
+        recalcular_rangos();
+
+        uart_print("\r\nPunto medio restablecido\r\n");
+        mostrar_configuracion();
+    }
+    else if (c == '4')
+    {
+        mostrar_configuracion();
+    }
+    else if (c == 'M' || c == 'm')
+    {
+        mostrar_menu();
+    }
+}
+
+void enviar_datos(float temperatura)
+{
+    char buffer[120];
+
+    int entero;
+    int decimal;
+
+    entero = (int)temperatura;
+
+    decimal = (int)((temperatura - entero) * 10);
+
+    if (decimal < 0)
+        decimal = -decimal;
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "\r\nTemperatura: %d.%d C | Accion: %s\r\n",
+        entero,
+        decimal,
+        accion_actual
+    );
+
+    uart_print(buffer);
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "DATA,%d.%d,%u,%u,%d,%d,%d\r\n",
+        entero,
+        decimal,
+        calefactor,
+        velocidad_ventilador,
+        punto_medio,
+        rango_min,
+        rango_max
+    );
+
+    uart_print(buffer);
+}
+
+void esperar_5_segundos(void)
+{
+    uint16_t i;
+
+    for (i = 0; i < 500; i++)
+    {
+        procesar_uart();
+        _delay_ms(10);
+    }
+}
+
+int main(void)
+{
+    float temperatura;
+
+    PORTB |= (1 << HEATER);
+
+    DDRB |=
+        (1 << HEATER) |
+        (1 << FAN_PWM);
+
+    heater_off();
+
+    uart_init();
+    i2c_init();
+    lcd_init();
+    adc_init();
+    pwm_init();
+
+    recalcular_rangos();
+
+    uart_print(
+        "\r\nSISTEMA DE CONTROL DE TEMPERATURA\r\n"
+    );
+
+    mostrar_menu();
+
+    lcd_line(0, "Sistema iniciado");
+    lcd_line(1, "Esperando...");
+
+    _delay_ms(1500);
+
+    while (1)
+    {
+        temperatura = leer_temperatura();
+
+        controlar_temperatura(temperatura);
+
+        actualizar_lcd(temperatura);
+
+        enviar_datos(temperatura);
+
+        esperar_5_segundos();
+    }
+}
