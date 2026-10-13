@@ -1,0 +1,264 @@
+import serial
+import time
+import csv
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from collections import deque
+
+
+PUERTO = "COM4"
+BAUDIOS = 9600
+
+
+ser = serial.Serial(
+    PUERTO,
+    BAUDIOS,
+    timeout=0.1
+)
+
+time.sleep(2)
+
+
+archivo = open(
+    "registro_temperatura.csv",
+    "w",
+    newline=""
+)
+
+csv_writer = csv.writer(archivo)
+
+csv_writer.writerow([
+    "Tiempo",
+    "Temperatura",
+    "Calefactor",
+    "Ventilador",
+    "Punto_medio",
+    "Rango_min",
+    "Rango_max"
+])
+
+
+tiempos = deque(maxlen=300)
+temperaturas = deque(maxlen=300)
+
+calefactor = deque(maxlen=300)
+ventilador = deque(maxlen=300)
+
+rangos_min = deque(maxlen=300)
+rangos_max = deque(maxlen=300)
+
+inicio = time.time()
+
+
+fig, (ax1, ax2) = plt.subplots(2, 1)
+
+
+def leer_serial():
+
+    while ser.in_waiting:
+
+        linea = ser.readline().decode(
+            "utf-8",
+            errors="ignore"
+        ).strip()
+
+        if linea:
+            print(linea)
+
+        if not linea.startswith("DATA,"):
+            continue
+
+        datos = linea.split(",")
+
+        if len(datos) != 7:
+            continue
+
+        try:
+
+            temperatura = float(datos[1])
+
+            heater = int(datos[2])
+
+            fan = int(datos[3])
+
+            punto_medio = int(datos[4])
+
+            minimo = int(datos[5])
+
+            maximo = int(datos[6])
+
+        except ValueError:
+            continue
+
+
+        tiempo = time.time() - inicio
+
+
+        tiempos.append(tiempo)
+
+        temperaturas.append(temperatura)
+
+        calefactor.append(heater * 100)
+
+        ventilador.append(fan)
+
+        rangos_min.append(minimo)
+
+        rangos_max.append(maximo)
+
+
+        csv_writer.writerow([
+            round(tiempo, 2),
+            temperatura,
+            heater,
+            fan,
+            punto_medio,
+            minimo,
+            maximo
+        ])
+
+        archivo.flush()
+
+
+def actualizar(frame):
+
+    leer_serial()
+
+    if len(tiempos) == 0:
+        return
+
+
+    ax1.clear()
+
+    ax1.plot(
+        tiempos,
+        temperaturas,
+        label="Temperatura"
+    )
+
+    ax1.plot(
+        tiempos,
+        rangos_min,
+        "--",
+        label="Limite inferior"
+    )
+
+    ax1.plot(
+        tiempos,
+        rangos_max,
+        "--",
+        label="Limite superior"
+    )
+
+    ax1.fill_between(
+        tiempos,
+        rangos_min,
+        rangos_max,
+        alpha=0.15
+    )
+
+    ax1.set_title(
+        "Control de temperatura"
+    )
+
+    ax1.set_ylabel(
+        "Temperatura (C)"
+    )
+
+    ax1.grid()
+
+    ax1.legend()
+
+
+    ax2.clear()
+
+    ax2.step(
+        tiempos,
+        calefactor,
+        where="post",
+        label="Calefactor"
+    )
+
+    ax2.step(
+        tiempos,
+        ventilador,
+        where="post",
+        label="Ventilador"
+    )
+
+    ax2.set_xlabel(
+        "Tiempo (s)"
+    )
+
+    ax2.set_ylabel(
+        "Potencia (%)"
+    )
+
+    ax2.set_ylim(
+        -5,
+        105
+    )
+
+    ax2.grid()
+
+    ax2.legend()
+
+
+def teclado(event):
+
+    if event.key == "up":
+
+        ser.write(b"2")
+
+        print("Aumentando punto medio")
+
+
+    elif event.key == "down":
+
+        ser.write(b"1")
+
+        print("Disminuyendo punto medio")
+
+
+    elif event.key == "r":
+
+        ser.write(b"3")
+
+        print("Punto medio restablecido")
+
+
+    elif event.key == "m":
+
+        ser.write(b"M")
+
+
+fig.canvas.mpl_connect(
+    "key_press_event",
+    teclado
+)
+
+
+animacion = FuncAnimation(
+    fig,
+    actualizar,
+    interval=500,
+    cache_frame_data=False
+)
+
+print("MONITOR DE TEMPERATURA")
+print("Flecha arriba : subir punto medio")
+print("Flecha abajo  : bajar punto medio")
+print("R             : volver a 22 C")
+print("M             : mostrar menu")
+
+try:
+
+    plt.tight_layout()
+
+    plt.show()
+
+finally:
+
+    archivo.close()
+
+    ser.close()
